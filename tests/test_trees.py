@@ -133,3 +133,23 @@ def test_unknown_impurity_raises():
         DecisionTreeClassifier(impurity="banana").fit(
             np.array([[0.0], [1.0]]), np.array([0, 1])
         )
+
+
+def test_min_samples_split_below_two_raises():
+    # values < 2 are degenerate no-ops (the guard len(y) < m can never
+    # fire for m <= 1), so they must be rejected loudly instead
+    X = np.array([[0.0], [1.0]])
+    y = np.array([0, 1])
+    for bad in (1, 0, -3):
+        with pytest.raises(ValueError):
+            DecisionTreeClassifier(min_samples_split=bad).fit(X, y)
+
+
+def test_invalid_max_depth_raises():
+    X = np.array([[0.0], [1.0]])
+    y = np.array([0, 1])
+    with pytest.raises(ValueError):
+        DecisionTreeClassifier(max_depth=0).fit(X, y)
+    # None and positive ints remain valid
+    assert DecisionTreeClassifier(max_depth=None).fit(X, y).score(X, y) == 1.0
+    assert DecisionTreeClassifier(max_depth=1).fit(X, y).score(X, y) == 1.0

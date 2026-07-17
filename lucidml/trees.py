@@ -336,7 +336,9 @@ class DecisionTreeClassifier:
         Maximum depth of the tree. ``None`` grows nodes until another
         stopping rule fires.
     min_samples_split : int, default=2
-        A node with fewer samples than this becomes a leaf.
+        A node with fewer samples than this becomes a leaf. Must be at
+        least 2 — the smallest number of samples a split can divide.
+        Smaller values would silently behave like 2, so they are rejected.
     impurity : {"entropy", "gini", "classification_error"} or callable, \
 default="entropy"
         Impurity measure used inside the information gain. A callable must
@@ -411,8 +413,21 @@ default="entropy"
         Raises
         ------
         ValueError
-            If ``impurity`` names no known measure.
+            If ``impurity`` names no known measure, if
+            ``min_samples_split`` is smaller than 2, or if ``max_depth``
+            is neither ``None`` nor a positive integer.
         """
+        if self.min_samples_split < 2:
+            raise ValueError(
+                f"min_samples_split must be >= 2, got {self.min_samples_split!r} "
+                "(a node needs at least 2 samples to be splittable; smaller "
+                "values would silently behave like 2)"
+            )
+        if self.max_depth is not None and self.max_depth < 1:
+            raise ValueError(
+                f"max_depth must be None or a positive integer, "
+                f"got {self.max_depth!r}"
+            )
         X = np.asarray(X, dtype=float)
         y = np.asarray(y)
         self._impurity_fn = self._resolve_impurity()
