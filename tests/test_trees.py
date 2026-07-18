@@ -11,6 +11,7 @@ from lucidml import (
     best_split,
     DecisionTreeClassifier,
 )
+from lucidml.trees import _best_split_fast, _IMPURITIES
 
 
 # --------------------------------------------------------------------------- #
@@ -153,3 +154,59 @@ def test_invalid_max_depth_raises():
     # None and positive ints remain valid
     assert DecisionTreeClassifier(max_depth=None).fit(X, y).score(X, y) == 1.0
     assert DecisionTreeClassifier(max_depth=1).fit(X, y).score(X, y) == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Fast split equivalence, MDI, max_features
+# --------------------------------------------------------------------------- #
+def test_fast_split_matches_reference():
+    # the vectorised search must find a split achieving exactly the
+    # reference loop's maximal gain, for every impurity, on random data
+    for seed in range(5):
+        rng = np.random.RandomState(seed)
+        X = rng.normal(size=(40, 4))
+        y = rng.randint(0, 3, size=40)
+        for name, fn in _IMPURITIES.items():
+            ref = best_split(X, y, fn)
+            fast = _best_split_fast(X, y, name)
+            assert np.isclose(fast["gain"], ref["gain"], atol=1e-9)
+            achieved = information_gain(
+                y, y[fast["left_mask"]], y[fast["right_mask"]], fn
+            )
+            assert np.isclose(achieved, ref["gain"], atol=1e-9)
+
+
+def test_mdi_sums_to_one_and_ranks_informative_feature():
+    rng = np.random.RandomState(1)
+    X = rng.normal(size=(300, 2))
+    y = (X[:, 0] > 0).astype(int)  # only feature 0 matters
+    clf = DecisionTreeClassifier(max_depth=4).fit(X, y)
+    imp = clf.feature_importances_
+    assert imp.shape == (2,)
+    assert np.all(imp >= 0)
+    assert np.isclose(imp.sum(), 1.0)
+    assert imp[0] > 0.8
+
+
+def test_mdi_single_leaf_tree_is_all_zeros():
+    clf = DecisionTreeClassifier().fit(
+        np.array([[0.0], [1.0], [2.0]]), np.array([1, 1, 1])
+    )
+    assert np.array_equal(clf.feature_importances_, np.zeros(1))
+
+
+def test_mdi_before_fit_raises():
+    with pytest.raises(RuntimeError):
+        DecisionTreeClassifier().feature_importances_
+
+
+def test_max_features_validation_and_reproducibility():
+    rng = np.random.RandomState(2)
+    X = rng.normal(size=(120, 5))
+    y = (X[:, 0] + X[:, 1] > 0).astype(int)
+    for bad in (0, -2, "banana", 1.5):
+        with pytest.raises(ValueError):
+            DecisionTreeClassifier(max_features=bad).fit(X, y)
+    a = DecisionTreeClassifier(max_features=2, random_state=5).fit(X, y).predict(X)
+    b = DecisionTreeClassifier(max_features=2, random_state=5).fit(X, y).predict(X)
+    assert np.array_equal(a, b)

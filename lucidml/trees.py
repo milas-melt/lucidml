@@ -200,13 +200,19 @@ def information_gain(y_parent, y_left, y_right, impurity=entropy):
     return impurity(y_parent) - w_left * impurity(y_left) - w_right * impurity(y_right)
 
 
-def best_split(X, y, impurity=entropy):
+def best_split(X, y, impurity=entropy, feature_indices=None):
     """Exhaustively search for the split maximising information gain.
 
     For every feature ``j`` and every candidate threshold ``tau`` — the
     midpoints between consecutive unique values of that feature — evaluate
     the split ``F_j <= tau`` and keep the pair with the highest
     :func:`information_gain`.
+
+    This is the *reference implementation*: a transparent double loop.
+    :class:`DecisionTreeClassifier` uses an equivalent vectorised routine
+    for the built-in impurity measures (see ``_best_split_fast``, tested
+    to agree with this function) and falls back to this one for custom
+    impurity callables.
 
     Parameters
     ----------
@@ -216,6 +222,9 @@ def best_split(X, y, impurity=entropy):
         Class labels of the node being split.
     impurity : callable, default=entropy
         Impurity measure passed through to :func:`information_gain`.
+    feature_indices : array-like of int, optional
+        Restrict the search to these feature columns (used for the random
+        feature subsets of random forests). ``None`` searches all features.
 
     Returns
     -------
@@ -254,8 +263,9 @@ def best_split(X, y, impurity=entropy):
         "left_mask": None,
         "right_mask": None,
     }
-    n_features = X.shape[1]
-    for j in range(n_features):
+    if feature_indices is None:
+        feature_indices = range(X.shape[1])
+    for j in feature_indices:
         values = np.unique(X[:, j])
         if len(values) < 2:
             continue
@@ -274,6 +284,80 @@ def best_split(X, y, impurity=entropy):
                     "left_mask": left_mask,
                     "right_mask": right_mask,
                 }
+    return best
+
+
+def _impurity_from_counts(counts, sizes, kind):
+    """Vectorised impurity for rows of class-count vectors.
+
+    Parameters
+    ----------
+    counts : ndarray of shape (m, K)
+        Class counts for ``m`` candidate children over ``K`` classes.
+    sizes : ndarray of shape (m,)
+        Row sums of ``counts`` (child sizes).
+    kind : {"entropy", "gini", "classification_error"}
+        Which impurity to compute.
+
+    Returns
+    -------
+    ndarray of shape (m,)
+        Impurity of each candidate child.
+    """
+    p = counts / sizes[:, None]
+    if kind == "entropy":
+        logp = np.zeros_like(p)
+        mask = p > 0
+        logp[mask] = np.log2(p[mask])
+        return -(p * logp).sum(axis=1)
+    if kind == "gini":
+        return (p * (1.0 - p)).sum(axis=1)
+    return 1.0 - p.max(axis=1)  # classification_error
+
+
+def _best_split_fast(X, y, impurity_name, feature_indices=None):
+    """Vectorised equivalent of :func:`best_split` for named impurities.
+
+    Sorts each feature once and evaluates *every* candidate threshold from
+    cumulative class counts — O(n log n + n K) per feature instead of the
+    reference loop's O(n^2). Same candidate thresholds (midpoints between
+    consecutive distinct values), same gains, same first-maximum
+    tie-breaking; a test asserts agreement with :func:`best_split`.
+    """
+    n = X.shape[0]
+    classes, y_idx = np.unique(y, return_inverse=True)
+    onehot = np.eye(len(classes))[y_idx]           # (n, K)
+    if feature_indices is None:
+        feature_indices = range(X.shape[1])
+
+    total = onehot.sum(axis=0, keepdims=True)      # (1, K)
+    parent_imp = _impurity_from_counts(total, np.array([n]), impurity_name)[0]
+
+    best = {"gain": -np.inf, "feature": None, "threshold": None,
+            "left_mask": None, "right_mask": None}
+    for j in feature_indices:
+        order = np.argsort(X[:, j], kind="mergesort")
+        xs = X[order, j]
+        boundary = np.nonzero(xs[1:] > xs[:-1])[0]  # split after these positions
+        if len(boundary) == 0:
+            continue
+        cum = np.cumsum(onehot[order], axis=0)      # (n, K)
+        n_left = boundary + 1
+        n_right = n - n_left
+        c_left = cum[boundary]
+        c_right = total - c_left
+        gains = (parent_imp
+                 - (n_left / n) * _impurity_from_counts(c_left, n_left, impurity_name)
+                 - (n_right / n) * _impurity_from_counts(c_right, n_right, impurity_name))
+        k = int(np.argmax(gains))                   # first max = lowest threshold
+        if gains[k] > best["gain"]:
+            best["gain"] = float(gains[k])
+            best["feature"] = j
+            best["threshold"] = float((xs[boundary[k]] + xs[boundary[k] + 1]) / 2.0)
+    if best["feature"] is not None:
+        left_mask = X[:, best["feature"]] <= best["threshold"]
+        best["left_mask"] = left_mask
+        best["right_mask"] = ~left_mask
     return best
 
 
@@ -301,14 +385,23 @@ class Node:
     prediction : object, optional
         Class label stored by a leaf. A node with a non-``None``
         prediction is a leaf.
+    n_samples : int, optional
+        Number of training samples that reached this node during ``fit``.
+    gain : float, optional
+        Information gain achieved by this node's split (internal nodes
+        only). Together with ``n_samples`` this is what Mean Decrease
+        Impurity feature importances are computed from.
     """
 
-    def __init__(self, *, feature=None, threshold=None, left=None, right=None, prediction=None):
+    def __init__(self, *, feature=None, threshold=None, left=None, right=None,
+                 prediction=None, n_samples=None, gain=None):
         self.feature = feature        # feature index j used to split (internal)
         self.threshold = threshold    # threshold tau (internal)
         self.left = left              # child for  F_j <= tau  (region R_L)
         self.right = right            # child for  F_j >  tau  (region R_R)
         self.prediction = prediction  # class label (leaves only)
+        self.n_samples = n_samples    # samples reaching this node at fit time
+        self.gain = gain              # information gain of the split (internal)
 
     @property
     def is_leaf(self):
@@ -342,12 +435,26 @@ class DecisionTreeClassifier:
     impurity : {"entropy", "gini", "classification_error"} or callable, \
 default="entropy"
         Impurity measure used inside the information gain. A callable must
-        have signature ``f(y) -> float``.
+        have signature ``f(y) -> float``. Named measures use a fast
+        vectorised split search; callables fall back to the reference
+        :func:`best_split` loop.
+    max_features : None, "sqrt" or int, default=None
+        Number of features to consider at *each split*, drawn uniformly
+        without replacement. ``None`` considers all features (a plain
+        decision tree); ``"sqrt"`` uses ``floor(sqrt(n_features))`` — the
+        usual random-forest choice; an ``int`` uses that many.
+    random_state : int or None, default=None
+        Seed for the per-split feature sampling. Only relevant when
+        ``max_features`` is not ``None``.
 
     Attributes
     ----------
     root : Node or None
         Root of the fitted tree; ``None`` until :meth:`fit` is called.
+    n_features_ : int
+        Number of features seen during :meth:`fit`.
+    feature_importances_ : ndarray of shape (n_features,)
+        Mean Decrease Impurity importances (property; available after fit).
 
     Notes
     -----
@@ -370,10 +477,13 @@ default="entropy"
     1
     """
 
-    def __init__(self, max_depth=None, min_samples_split=2, impurity="entropy"):
+    def __init__(self, max_depth=None, min_samples_split=2, impurity="entropy",
+                 max_features=None, random_state=None):
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
         self.impurity = impurity
+        self.max_features = max_features
+        self.random_state = random_state
         self.root = None
 
     def _resolve_impurity(self):
@@ -414,8 +524,10 @@ default="entropy"
         ------
         ValueError
             If ``impurity`` names no known measure, if
-            ``min_samples_split`` is smaller than 2, or if ``max_depth``
-            is neither ``None`` nor a positive integer.
+            ``min_samples_split`` is smaller than 2, if ``max_depth``
+            is neither ``None`` nor a positive integer, or if
+            ``max_features`` is not ``None``, ``"sqrt"`` or a positive
+            integer.
         """
         if self.min_samples_split < 2:
             raise ValueError(
@@ -431,8 +543,35 @@ default="entropy"
         X = np.asarray(X, dtype=float)
         y = np.asarray(y)
         self._impurity_fn = self._resolve_impurity()
+        self.n_features_ = X.shape[1]
+        self._rng = np.random.RandomState(self.random_state)
+        mf = self.max_features
+        if mf is None:
+            self._n_subset = None
+        elif mf == "sqrt":
+            self._n_subset = max(1, int(np.sqrt(self.n_features_)))
+        elif isinstance(mf, (int, np.integer)) and not isinstance(mf, bool) and mf >= 1:
+            self._n_subset = min(int(mf), self.n_features_)
+        else:
+            raise ValueError(
+                f"max_features must be None, 'sqrt' or a positive integer, "
+                f"got {mf!r}"
+            )
         self.root = self._build(X, y, depth=0)
         return self
+
+    def _choose_split(self, X, y):
+        """Search for the best split, restricted to a random feature subset
+        when ``max_features`` is set. Named impurities use the vectorised
+        search; callables use the reference loop."""
+        if self._n_subset is not None and self._n_subset < self.n_features_:
+            feats = self._rng.choice(self.n_features_, size=self._n_subset,
+                                     replace=False)
+        else:
+            feats = None
+        if callable(self.impurity):
+            return best_split(X, y, self._impurity_fn, feature_indices=feats)
+        return _best_split_fast(X, y, self.impurity, feature_indices=feats)
 
     @staticmethod
     def _majority(y):
@@ -453,11 +592,11 @@ default="entropy"
             or len(y) < self.min_samples_split
             or (self.max_depth is not None and depth >= self.max_depth)
         ):
-            return Node(prediction=self._majority(y))
+            return Node(prediction=self._majority(y), n_samples=len(y))
 
-        split = best_split(X, y, self._impurity_fn)
+        split = self._choose_split(X, y)
         if split["feature"] is None or split["gain"] <= 0:
-            return Node(prediction=self._majority(y))
+            return Node(prediction=self._majority(y), n_samples=len(y))
 
         left = self._build(X[split["left_mask"]], y[split["left_mask"]], depth + 1)
         right = self._build(X[split["right_mask"]], y[split["right_mask"]], depth + 1)
@@ -466,6 +605,8 @@ default="entropy"
             threshold=split["threshold"],
             left=left,
             right=right,
+            n_samples=len(y),
+            gain=split["gain"],
         )
 
     def _predict_one(self, x, node):
@@ -530,3 +671,40 @@ default="entropy"
             return 1 + max(_depth(node.left), _depth(node.right))
 
         return _depth(self.root)
+
+    @property
+    def feature_importances_(self):
+        """Mean Decrease Impurity (MDI) feature importances.
+
+        For every internal node ``n`` splitting on feature ``j``, add
+        ``w_n * gain_n`` to feature ``j``, where ``w_n`` is the fraction
+        of training samples that reached the node; finally normalise so
+        the importances sum to 1.
+
+        Returns
+        -------
+        ndarray of shape (n_features,)
+            Importance of each feature; all zeros if the tree is a single
+            leaf. This is an **in-sample** measure: it is computed from
+            training-time gains, so it can credit features the tree used
+            to overfit.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`fit`.
+        """
+        if self.root is None:
+            raise RuntimeError("call fit before feature_importances_")
+        importances = np.zeros(self.n_features_)
+        n_root = self.root.n_samples
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            if node.is_leaf:
+                continue
+            importances[node.feature] += (node.n_samples / n_root) * node.gain
+            stack.append(node.left)
+            stack.append(node.right)
+        total = importances.sum()
+        return importances / total if total > 0 else importances

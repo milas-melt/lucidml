@@ -24,3 +24,6 @@ htmlcov/
 
 # OS
 .DS_Store
+
+# Private study material (not part of the published package)
+interview_bank/
